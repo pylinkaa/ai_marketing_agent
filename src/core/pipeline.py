@@ -1,0 +1,248 @@
+"""End-to-end pipeline for marketing agent."""
+
+import logging
+import yaml
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import pandas as pd
+
+from src.core.types import (
+    CampaignRequest,
+    GeneratedMessage,
+    SegmentMetrics,
+    SegmentProfile,
+)
+from src.utils.io import load_csv, save_outputs
+from src.features.build_features import build_features
+from src.segmentation.rule_based import segment_users
+from src.segmentation.describe_segment import describe_all_segments
+from src.segmentation.ml_model import train_segmentation_model, predict_segments
+from src.prompting.builder import build_prompt
+from src.llm.generation import generate_message
+from src.llm.postprocess import postprocess_messages
+
+logger = logging.getLogger(__name__)
+
+
+def load_config(config_path: str = "configs/default.yaml") -> Dict:
+    """Load configuration from YAML file."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    return config
+
+
+def calculate_metrics(
+    df: pd.DataFrame,
+    segment_labels: pd.Series,
+    segmentation_mode: str = "rule",
+    clustering_metrics: Optional[Dict] = None,
+) -> SegmentMetrics:
+    """
+    Calculate segmentation quality metrics.
+    
+    Args:
+        df: Original DataFrame
+        segment_labels: Segment labels for each user
+        segmentation_mode: "rule" or "ml"
+        clustering_metrics: Clustering metrics (if ML mode)
+        
+    Returns:
+        SegmentMetrics object
+    """
+    # Segment sizes
+    segment_sizes = segment_labels.value_counts().to_dict()
+    total_users = len(df)
+    
+    # Validation metrics (compare with true_* fields if available)
+    validation_metrics = None
+    if "true_segment_label" in df.columns:
+        # Calculate accuracy
+        true_labels = df["true_segment_label"].fillna("")
+        pred_labels = segment_labels.fillna("")
+        
+        # Exact match accuracy
+        exact_matches = (true_labels == pred_labels).sum()
+        accuracy = exact_matches / len(df) if len(df) > 0 else 0.0
+        
+        validation_metrics = {
+            "segment_label_accuracy": accuracy,
+            "exact_matches": int(exact_matches),
+            "total_users": total_users,
+        }
+        
+        # Compare with true_next_goal if available
+        if "true_next_goal" in df.columns:
+            # This would be compared against campaign goal in real scenario
+            pass
+        
+        # Compare with true_recommended_channel if available
+        if "true_recommended_channel" in df.columns:
+            # This would be compared against campaign channel in real scenario
+            pass
+    
+    metrics = SegmentMetrics(
+        segment_sizes=segment_sizes,
+        total_users=total_users,
+        clustering_metrics=clustering_metrics,
+        validation_metrics=validation_metrics,
+    )
+    
+    return metrics
+
+
+def run_pipeline(
+    input_path: str,
+    campaign_request: CampaignRequest,
+    config_path: str = "configs/default.yaml",
+    segmentation_mode: str = "rule",
+    llm_mode: str = "mock",
+) -> Tuple[List[GeneratedMessage], SegmentMetrics]:
+    """Run end-to-end pipeline."""
+    logger.info("Starting pipeline")
+    
+    # Load config
+    config = load_config(config_path)
+    
+    # Set max_length from config
+    channel_limits = config.get("channel_limits", {})
+    campaign_request.max_length = channel_limits.get(campaign_request.channel)
+    
+    # Step 1: Load data
+    logger.info("Step 1: Loading data")
+    df = load_csv(input_path)
+    
+    # Step 2: Build features
+    logger.info("Step 2: Building features")
+    features_config = config.get("features", {})
+    features_df, original_df = build_features(
+        df,
+        exclude_true_fields=features_config.get("exclude_true_fields", True),
+        normalize=features_config.get("normalize_for_ml", False) and segmentation_mode == "ml",
+    )
+    
+    # Step 3: Segment users
+    logger.info(f"Step 3: Segmenting users (mode: {segmentation_mode})")
+    segmentation_cfg = config.get("segmentation", {})
+    if segmentation_mode == "rule":
+        seg_config = segmentation_cfg.get("rule_based", {})
+        segment_labels = segment_users(
+            original_df,
+            new_user_days=seg_config.get("new_user_days", 30),
+            dormant_days=seg_config.get("dormant_days", 60),
+            vip_purchase_threshold=seg_config.get("vip_purchase_threshold", 3),
+            vip_ltv_threshold=seg_config.get("vip_ltv_threshold", 3000.0),
+            active_days_threshold=seg_config.get("active_days_threshold", 30),
+        )
+        clustering_metrics = None
+    elif segmentation_mode == "ml":
+        ml_cfg = segmentation_cfg.get("ml", {})
+
+        # Target for supervised segmentation
+        target_column = ml_cfg.get("target_column", "true_segment_label")
+        if target_column in original_df.columns:
+            logger.info("Using %s as target for ML segmentation", target_column)
+            y_labels = original_df[target_column]
+        else:
+            logger.warning(
+                "Target column %s not found, falling back to rule-based segments as target",
+                target_column,
+            )
+            rule_cfg = segmentation_cfg.get("rule_based", {})
+            y_labels = segment_users(
+                original_df,
+                new_user_days=rule_cfg.get("new_user_days", 30),
+                dormant_days=rule_cfg.get("dormant_days", 60),
+                vip_purchase_threshold=rule_cfg.get("vip_purchase_threshold", 3),
+                vip_ltv_threshold=rule_cfg.get("vip_ltv_threshold", 3000.0),
+                active_days_threshold=rule_cfg.get("active_days_threshold", 30),
+            )
+
+        # Train model on full dataset
+        model, label_encoder = train_segmentation_model(
+            features_df,
+            y_labels,
+            n_estimators=ml_cfg.get("n_estimators", 200),
+            max_depth=ml_cfg.get("max_depth"),
+            random_state=ml_cfg.get("random_state", 42),
+        )
+
+        # Predict segments
+        segment_labels = predict_segments(model, label_encoder, features_df)
+
+        clustering_metrics = {
+            "model": "RandomForestClassifier",
+            "n_classes": int(segment_labels.nunique()),
+        }
+    else:
+        raise ValueError(f"Unknown segmentation mode: {segmentation_mode}")
+    
+    # Step 4: Describe segments
+    logger.info("Step 4: Describing segments")
+    segment_profiles = describe_all_segments(original_df, segment_labels)
+    
+    # Step 5: Generate messages for each user
+    logger.info("Step 5: Generating messages")
+    generated_messages = []
+    
+    for user_idx, row in original_df.iterrows():
+        user_id = row["user_id"]
+        segment_label = segment_labels.iloc[user_idx]
+        segment_profile = segment_profiles[segment_label]
+        
+        # Build prompt
+        prompt = build_prompt(segment_profile, campaign_request)
+        
+        # Generate variants
+        llm_config = config.get("llm", {})
+        llm_mode_actual = llm_mode or llm_config.get("mode", "mock")
+        
+        # Prepare configs for different LLM providers
+        openai_config = llm_config.get("openai", {})
+        hf_config = llm_config.get("hf", {})
+        groq_config = llm_config.get("groq", {})
+        
+        # Generate single high-quality message
+        raw_message = generate_message(
+            prompt,
+            campaign_request,
+            llm_mode=llm_mode_actual,
+            openai_config=openai_config,
+            hf_config=hf_config,
+            groq_config=groq_config,
+        )
+        
+        # Post-process
+        processed_message = postprocess_messages(
+            [raw_message],
+            max_length=campaign_request.max_length,
+            style=campaign_request.style,
+        )[0] if raw_message else "Сообщение не сгенерировано"
+        
+        # Create GeneratedMessage
+        message = GeneratedMessage(
+            user_id=user_id,
+            segment_label=segment_label,
+            segment_profile_brief=segment_profile.to_brief(),
+            goal=campaign_request.goal,
+            channel=campaign_request.channel,
+            message=processed_message,
+            generation_metadata={
+                "llm_mode": llm_mode_actual,
+                "timestamp": pd.Timestamp.now().isoformat(),
+            },
+        )
+        generated_messages.append(message)
+    
+    # Step 6: Calculate metrics
+    logger.info("Step 6: Calculating metrics")
+    metrics = calculate_metrics(
+        original_df,
+        segment_labels,
+        segmentation_mode=segmentation_mode,
+        clustering_metrics=clustering_metrics,
+    )
+    
+    logger.info("Pipeline completed successfully")
+    
+    return generated_messages, metrics
+

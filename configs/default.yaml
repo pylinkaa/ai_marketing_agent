@@ -1,0 +1,87 @@
+# Default configuration for marketing agent pipeline
+
+# Segmentation settings
+segmentation:
+  mode: "rule"  # rule or ml
+  
+  # Rule-based thresholds
+  rule_based:
+    new_user_days: 30
+    dormant_days: 60
+    vip_purchase_threshold: 3
+    vip_ltv_threshold: 3000.0
+    active_days_threshold: 30
+  
+  # ML segmentation settings
+  ml:
+    algorithm: "rf"  # rf (RandomForest)
+    n_estimators: 200
+    max_depth: null
+    random_state: 42
+    normalize_features: true
+    target_column: "true_segment_label"
+
+# LLM generation settings
+llm:
+  mode: "mock"  # mock, openai, hf (huggingface), or groq (can be overridden via CLI)
+  openai:
+    model: "gpt-4o-mini"
+    api_url: "https://api.openai.com/v1/chat/completions"
+    temperature: 0.7
+    max_tokens: 200
+    max_retries: 3
+    timeout: 30
+  # Hugging Face Inference API (free tier)
+  hf:
+    model: "mistralai/Mistral-7B-Instruct-v0.2"
+    api_url: null  # Auto-generated from model name
+    temperature: 0.7
+    max_tokens: 200
+    max_retries: 3
+    timeout: 60
+  # Groq API (free tier, very fast)
+  groq:
+    model: "llama-3.1-8b-instant"  # or "mixtral-8x7b-32768", "gemma-7b-it"
+    api_url: "https://api.groq.com/openai/v1/chat/completions"
+    temperature: 0.7
+    max_tokens: 200
+    max_retries: 3
+    timeout: 30
+
+# Channel length limits (characters)
+channel_limits:
+  push: 100
+  email: 500
+  inapp: 300
+
+# Goal and channel mappings
+goals:
+  - активация
+  - реактивация
+  - удержание
+  - upsell
+  - промо
+  - сервис
+
+channels:
+  - push
+  - email
+  - inapp
+
+styles:
+  - дружелюбный
+  - формальный
+  - срочный
+  - информативный
+
+# Feature engineering
+features:
+  exclude_true_fields: true  # Exclude true_* fields from features
+  normalize_for_ml: true
+
+# Output settings
+output:
+  save_csv: true
+  save_json: true
+  output_dir: "outputs"
+
