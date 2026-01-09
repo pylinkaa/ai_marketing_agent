@@ -303,6 +303,7 @@ python3 -m src.app.cli \
 ```bash
 python3 -m src.app.cli --interactive
 ```
+<<<<<<< HEAD
 
 ---
 
