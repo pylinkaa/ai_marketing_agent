@@ -132,6 +132,7 @@ class CampaignRequest:
     channel: str  # push, email, inapp
     style: str = "дружелюбный"  # дружелюбный, формальный, срочный, информативный
     max_length: Optional[int] = None  # Will be set from config based on channel
+    n_variants: int = 1  # Number of message variants to generate (1-3)
 
 
 @dataclass

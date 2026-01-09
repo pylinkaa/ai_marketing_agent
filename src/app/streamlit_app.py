@@ -171,6 +171,14 @@ def render_sidebar():
     elif llm_mode == "openai":
         st.sidebar.warning("⚠️ OpenAI: Платный API. Требуется OPENAI_API_KEY")
     
+    # Number of variants
+    n_variants = st.sidebar.selectbox(
+        "📝 Количество вариантов сообщений",
+        options=[1, 2, 3],
+        index=0,
+        help="1: один лучший вариант (продакшн)\n2-3: несколько вариантов с ранжированием (демо)",
+    )
+    
     st.sidebar.divider()
     
     return {
@@ -179,6 +187,7 @@ def render_sidebar():
         "style": style,
         "segmentation_mode": segmentation_mode,
         "llm_mode": llm_mode,
+        "n_variants": n_variants,
     }
 
 
@@ -197,6 +206,7 @@ def run_pipeline_ui(config: dict) -> Tuple[Optional[List[GeneratedMessage]], Opt
             goal=config["goal"],
             channel=config["channel"],
             style=config["style"],
+            n_variants=config.get("n_variants", 1),
         )
         
         with st.spinner("🔄 Запуск пайплайна..."):
