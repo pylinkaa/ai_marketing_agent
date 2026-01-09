@@ -16,10 +16,15 @@ from src.utils.io import load_csv, save_outputs
 from src.features.build_features import build_features
 from src.segmentation.rule_based import segment_users
 from src.segmentation.describe_segment import describe_all_segments
-from src.segmentation.ml_model import train_segmentation_model, predict_segments
+from src.segmentation.ml_model import (
+    train_segmentation_model,
+    predict_segments,
+    cluster_users_kmeans,
+)
 from src.prompting.builder import build_prompt
-from src.llm.generation import generate_message
+from src.llm.generation import generate_messages
 from src.llm.postprocess import postprocess_messages
+from src.llm.ranking import rank_messages
 
 logger = logging.getLogger(__name__)
 
@@ -136,43 +141,57 @@ def run_pipeline(
         clustering_metrics = None
     elif segmentation_mode == "ml":
         ml_cfg = segmentation_cfg.get("ml", {})
+        algorithm = ml_cfg.get("algorithm", "rf")
 
-        # Target for supervised segmentation
-        target_column = ml_cfg.get("target_column", "true_segment_label")
-        if target_column in original_df.columns:
-            logger.info("Using %s as target for ML segmentation", target_column)
-            y_labels = original_df[target_column]
+        if algorithm == "rf":
+            # Supervised: RandomForest
+            # Target for supervised segmentation
+            target_column = ml_cfg.get("target_column", "true_segment_label")
+            if target_column in original_df.columns:
+                logger.info("Using %s as target for ML segmentation", target_column)
+                y_labels = original_df[target_column]
+            else:
+                logger.warning(
+                    "Target column %s not found, falling back to rule-based segments as target",
+                    target_column,
+                )
+                rule_cfg = segmentation_cfg.get("rule_based", {})
+                y_labels = segment_users(
+                    original_df,
+                    new_user_days=rule_cfg.get("new_user_days", 30),
+                    dormant_days=rule_cfg.get("dormant_days", 60),
+                    vip_purchase_threshold=rule_cfg.get("vip_purchase_threshold", 3),
+                    vip_ltv_threshold=rule_cfg.get("vip_ltv_threshold", 3000.0),
+                    active_days_threshold=rule_cfg.get("active_days_threshold", 30),
+                )
+
+            # Train model with train/test split
+            test_size = ml_cfg.get("test_size", 0.2)
+            model, label_encoder, ml_metrics = train_segmentation_model(
+                features_df,
+                y_labels,
+                n_estimators=ml_cfg.get("n_estimators", 200),
+                max_depth=ml_cfg.get("max_depth"),
+                random_state=ml_cfg.get("random_state", 42),
+                test_size=test_size,
+            )
+
+            # Predict segments on full dataset (for message generation)
+            segment_labels = predict_segments(model, label_encoder, features_df)
+
+            clustering_metrics = ml_metrics
+
+        elif algorithm == "kmeans":
+            # Unsupervised: K-Means clustering
+            n_clusters = ml_cfg.get("n_clusters", 5)
+            segment_labels, clustering_metrics = cluster_users_kmeans(
+                features_df,
+                n_clusters=n_clusters,
+                random_state=ml_cfg.get("random_state", 42),
+                max_iter=ml_cfg.get("max_iter", 300),
+            )
         else:
-            logger.warning(
-                "Target column %s not found, falling back to rule-based segments as target",
-                target_column,
-            )
-            rule_cfg = segmentation_cfg.get("rule_based", {})
-            y_labels = segment_users(
-                original_df,
-                new_user_days=rule_cfg.get("new_user_days", 30),
-                dormant_days=rule_cfg.get("dormant_days", 60),
-                vip_purchase_threshold=rule_cfg.get("vip_purchase_threshold", 3),
-                vip_ltv_threshold=rule_cfg.get("vip_ltv_threshold", 3000.0),
-                active_days_threshold=rule_cfg.get("active_days_threshold", 30),
-            )
-
-        # Train model on full dataset
-        model, label_encoder = train_segmentation_model(
-            features_df,
-            y_labels,
-            n_estimators=ml_cfg.get("n_estimators", 200),
-            max_depth=ml_cfg.get("max_depth"),
-            random_state=ml_cfg.get("random_state", 42),
-        )
-
-        # Predict segments
-        segment_labels = predict_segments(model, label_encoder, features_df)
-
-        clustering_metrics = {
-            "model": "RandomForestClassifier",
-            "n_classes": int(segment_labels.nunique()),
-        }
+            raise ValueError(f"Unknown ML algorithm: {algorithm}")
     else:
         raise ValueError(f"Unknown segmentation mode: {segmentation_mode}")
     
@@ -201,8 +220,8 @@ def run_pipeline(
         hf_config = llm_config.get("hf", {})
         groq_config = llm_config.get("groq", {})
         
-        # Generate single high-quality message
-        raw_message = generate_message(
+        # Generate message variants
+        raw_variants = generate_messages(
             prompt,
             campaign_request,
             llm_mode=llm_mode_actual,
@@ -211,24 +230,41 @@ def run_pipeline(
             groq_config=groq_config,
         )
         
-        # Post-process
-        processed_message = postprocess_messages(
-            [raw_message],
+        # Post-process all variants
+        processed_variants = postprocess_messages(
+            raw_variants,
             max_length=campaign_request.max_length,
             style=campaign_request.style,
-        )[0] if raw_message else "Сообщение не сгенерировано"
+        )
         
-        # Create GeneratedMessage
+        # Rank and select best message
+        if len(processed_variants) > 1:
+            best_message, ranking_score, ranking_details = rank_messages(
+                processed_variants,
+                campaign_request,
+            )
+        else:
+            best_message = processed_variants[0] if processed_variants else "Сообщение не сгенерировано"
+            ranking_score = None
+            ranking_details = {}
+        
+        # Create GeneratedMessage with variants
         message = GeneratedMessage(
             user_id=user_id,
             segment_label=segment_label,
             segment_profile_brief=segment_profile.to_brief(),
             goal=campaign_request.goal,
             channel=campaign_request.channel,
-            message=processed_message,
+            message=best_message,
+            message_v1=processed_variants[0] if len(processed_variants) > 0 else None,
+            message_v2=processed_variants[1] if len(processed_variants) > 1 else None,
+            message_v3=processed_variants[2] if len(processed_variants) > 2 else None,
+            ranking_score=ranking_score,
             generation_metadata={
                 "llm_mode": llm_mode_actual,
                 "timestamp": pd.Timestamp.now().isoformat(),
+                "n_variants": len(processed_variants),
+                "ranking_details": ranking_details,
             },
         )
         generated_messages.append(message)

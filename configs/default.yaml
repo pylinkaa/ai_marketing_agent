@@ -14,12 +14,17 @@ segmentation:
   
   # ML segmentation settings
   ml:
-    algorithm: "rf"  # rf (RandomForest)
+    algorithm: "rf"  # rf (RandomForest) or kmeans (K-Means clustering)
+    # RandomForest settings
     n_estimators: 200
     max_depth: null
     random_state: 42
+    test_size: 0.2  # Proportion for test set (0.0 to 1.0, 0.0 = use all data for training)
     normalize_features: true
     target_column: "true_segment_label"
+    # K-Means settings
+    n_clusters: 5  # Number of clusters for kmeans algorithm
+    max_iter: 300  # Maximum iterations for K-Means
 
 # LLM generation settings
 llm:

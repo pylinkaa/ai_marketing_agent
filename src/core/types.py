@@ -142,12 +142,16 @@ class GeneratedMessage:
     segment_profile_brief: str
     goal: str
     channel: str
-    message: str  # Single high-quality message
+    message: str  # Best selected message (always present)
+    message_v1: Optional[str] = None  # Variant 1 (if n_variants > 1)
+    message_v2: Optional[str] = None  # Variant 2 (if n_variants > 1)
+    message_v3: Optional[str] = None  # Variant 3 (if n_variants >= 3)
+    ranking_score: Optional[float] = None  # Score of selected message
     generation_metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for CSV/JSON export."""
-        return {
+        result = {
             "user_id": self.user_id,
             "segment_label": self.segment_label,
             "segment_profile_brief": self.segment_profile_brief,
@@ -156,6 +160,16 @@ class GeneratedMessage:
             "message": self.message,
             "generation_metadata": str(self.generation_metadata) if self.generation_metadata else "",
         }
+        # Add variants if present
+        if self.message_v1:
+            result["message_v1"] = self.message_v1
+        if self.message_v2:
+            result["message_v2"] = self.message_v2
+        if self.message_v3:
+            result["message_v3"] = self.message_v3
+        if self.ranking_score is not None:
+            result["ranking_score"] = self.ranking_score
+        return result
 
 
 @dataclass

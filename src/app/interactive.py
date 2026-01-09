@@ -12,7 +12,8 @@ from src.features.build_features import build_features
 from src.segmentation.rule_based import segment_users
 from src.segmentation.describe_segment import describe_all_segments
 from src.prompting.builder import build_prompt
-from src.llm.generation import generate_message
+from src.llm.generation import generate_messages
+from src.llm.ranking import rank_messages
 from src.llm.postprocess import postprocess_messages
 
 logging.basicConfig(
@@ -230,9 +231,17 @@ def show_messages(messages: List[GeneratedMessage], segment_label: str):
     
     for i, msg in enumerate(messages[:sample_size], 1):
         print(f"\n--- Пользователь {msg.user_id} ---")
-        print(f"Вариант 1: {msg.message_v1}")
-        print(f"Вариант 2: {msg.message_v2}")
-        print(f"Вариант 3: {msg.message_v3}")
+        print(f"✅ Выбранное сообщение: {msg.message}")
+        if msg.ranking_score is not None:
+            print(f"   (Оценка ранжирования: {msg.ranking_score:.1f})")
+        if msg.message_v1 or msg.message_v2 or msg.message_v3:
+            print("Варианты:")
+            if msg.message_v1:
+                print(f"  Вариант 1: {msg.message_v1}")
+            if msg.message_v2:
+                print(f"  Вариант 2: {msg.message_v2}")
+            if msg.message_v3:
+                print(f"  Вариант 3: {msg.message_v3}")
     
     if len(messages) > sample_size:
         print(f"\n... и еще {len(messages) - sample_size} пользователей")
@@ -326,19 +335,30 @@ def interactive_mode():
             # Построить промпт
             prompt = build_prompt(seg_profile, campaign_request)
             
-            # Сгенерировать сообщение
-            message_text = generate_message(
+            # Сгенерировать варианты сообщений
+            raw_variants = generate_messages(
                 prompt,
                 campaign_request,
                 llm_mode="mock",
             )
             
             # Постобработка
-            processed_message = postprocess_messages(
-                [message_text],
+            processed_variants = postprocess_messages(
+                raw_variants,
                 max_length=campaign_request.max_length,
                 style=campaign_request.style,
-            )[0]
+            )
+            
+            # Ранжирование и выбор лучшего
+            if len(processed_variants) > 1:
+                best_message, ranking_score, ranking_details = rank_messages(
+                    processed_variants,
+                    campaign_request,
+                )
+            else:
+                best_message = processed_variants[0] if processed_variants else "Сообщение не сгенерировано"
+                ranking_score = None
+                ranking_details = {}
             
             # Создать сообщение
             message = GeneratedMessage(
@@ -347,9 +367,15 @@ def interactive_mode():
                 segment_profile_brief=seg_profile.to_brief(),
                 goal=goal,
                 channel=channel,
-                message=processed_message,
+                message=best_message,
+                message_v1=processed_variants[0] if len(processed_variants) > 0 else None,
+                message_v2=processed_variants[1] if len(processed_variants) > 1 else None,
+                message_v3=processed_variants[2] if len(processed_variants) > 2 else None,
+                ranking_score=ranking_score,
                 generation_metadata={
                     "llm_mode": "mock",
+                    "n_variants": len(processed_variants),
+                    "ranking_details": ranking_details,
                 },
             )
             generated_messages.append(message)

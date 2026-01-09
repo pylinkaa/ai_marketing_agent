@@ -61,6 +61,14 @@ def main():
     )
     
     parser.add_argument(
+        "--n-variants",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="Количество вариантов сообщений для генерации и ранжирования (1-3, по умолчанию: 1)",
+    )
+    
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="outputs",
@@ -113,6 +121,7 @@ def main():
         goal=args.goal,
         channel=args.channel,
         style=args.style,
+        n_variants=args.n_variants,
     )
     
     # Run pipeline
