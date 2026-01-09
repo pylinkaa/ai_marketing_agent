@@ -332,8 +332,37 @@ def interactive_mode():
             else:
                 seg_profile = segment_profile
             
-            # Построить промпт
-            prompt = build_prompt(seg_profile, campaign_request)
+            # Build user context (without PII)
+            user_context = {}
+            
+            # Category interest
+            category = (
+                row.get("last_view_category")
+                or row.get("category_affinity_top")
+                or row.get("last_category")
+            )
+            if pd.notna(category) and category:
+                user_context["category_affinity_top"] = str(category)
+                user_context["last_view_category"] = str(category)
+            
+            # Abandoned cart
+            if "abandoned_cart_flag" in row:
+                user_context["abandoned_cart_flag"] = bool(row.get("abandoned_cart_flag", 0))
+            
+            # Days since last activity
+            if "days_since_last_activity" in row:
+                days = row.get("days_since_last_activity")
+                if pd.notna(days):
+                    user_context["days_since_last_activity"] = float(days)
+            
+            # Price sensitivity
+            if "price_sensitivity" in row:
+                sens = row.get("price_sensitivity")
+                if pd.notna(sens):
+                    user_context["price_sensitivity"] = float(sens)
+            
+            # Построить промпт с user context
+            prompt = build_prompt(seg_profile, campaign_request, user_context=user_context if user_context else None)
             
             # Сгенерировать варианты сообщений
             raw_variants = generate_messages(
@@ -349,11 +378,21 @@ def interactive_mode():
                 style=campaign_request.style,
             )
             
+            # Extract user category for ranking bonus
+            user_category = None
+            if user_context:
+                user_category = (
+                    user_context.get("last_view_category")
+                    or user_context.get("category_affinity_top")
+                    or user_context.get("last_category")
+                )
+            
             # Ранжирование и выбор лучшего
             if len(processed_variants) > 1:
                 best_message, ranking_score, ranking_details = rank_messages(
                     processed_variants,
                     campaign_request,
+                    user_category=user_category,
                 )
             else:
                 best_message = processed_variants[0] if processed_variants else "Сообщение не сгенерировано"

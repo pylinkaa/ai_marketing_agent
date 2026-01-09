@@ -2,16 +2,19 @@
 
 import logging
 import re
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 from src.core.types import CampaignRequest
 
 logger = logging.getLogger(__name__)
 
-# Common generic phrases that should be penalized
-GENERIC_PHRASES = [
-    r"у нас\s+много",
-    r"широкий\s+ассортимент",
+# Запрещенные клише (расширенный список)
+FORBIDDEN_CLICHES = [
+    r"у нас\s+много\s+новинок",
+    r"заканчивай\s+покупку",
+    r"возвращайся\s+к",
+    r"мы\s+заметили,\s+что",
+    r"у нас\s+широкий\s+ассортимент",
     r"большой\s+выбор",
     r"много\s+товаров",
     r"разнообразие\s+товаров",
@@ -19,7 +22,25 @@ GENERIC_PHRASES = [
     r"множество\s+вариантов",
 ]
 
-# Specific phrases that should be rewarded
+# CTA глаголы (расширенный список)
+CTA_VERBS = [
+    r"оформи",
+    r"забери",
+    r"вернись",
+    r"смотри",
+    r"выбери",
+    r"получи",
+    r"купи",
+    r"закажи",
+    r"воспользуйся",
+    r"начни",
+    r"успей",
+    r"перейди",
+    r"открой",
+    r"попробуй",
+]
+
+# Специфичные фразы (бонусы)
 SPECIFIC_PHRASES = [
     r"\d+%",  # Percentage discount
     r"\d+\s*руб",  # Specific price
@@ -30,35 +51,25 @@ SPECIFIC_PHRASES = [
     r"эксклюзивн[аяое]",  # Exclusive
 ]
 
-# CTA phrases
-CTA_PHRASES = [
-    r"купите",
-    r"закажите",
-    r"оформите",
-    r"получите",
-    r"воспользуйтесь",
-    r"начните",
-    r"успейте",
-    r"перейдите",
-]
+# Латиница
+LATIN_PATTERN = re.compile(r'\b[A-Za-z]+\b')
 
 
 def rank_messages(
     messages: List[str],
     campaign_request: CampaignRequest,
+    user_category: Optional[str] = None,
 ) -> Tuple[str, float, Dict[str, Any]]:
-    """Rank messages and select the best one.
+    """Rank messages and select the best one with enhanced scoring.
     
     Scoring criteria:
-    - Penalty for exceeding max_length
-    - Penalty for generic phrases
-    - Bonus for specific details (discounts, prices, categories)
-    - Bonus for CTA phrases
-    - Bonus for style compliance
+    - Heavy penalties for Latin, quotes, ellipsis, cliches
+    - Bonuses for CTA, category mention, proper length, emojis
     
     Args:
         messages: List of message variants
         campaign_request: Campaign request with constraints
+        user_category: Optional user category for bonus scoring
         
     Returns:
         Tuple of (best_message, score, ranking_details)
@@ -84,7 +95,37 @@ def rank_messages(
             "bonuses": [],
         }
         
-        # 1. Length penalty (exponential for severe violations)
+        # 1. LATIN PENALTY (very heavy)
+        latin_words = LATIN_PATTERN.findall(msg)
+        # Filter out common abbreviations
+        latin_words = [w for w in latin_words if w.lower() not in ['iphone', 'wifi', 'ios', 'android', 'sms', 'email', 'push']]
+        if latin_words:
+            penalty = -100
+            score += penalty
+            details["penalties"].append(f"latin_characters({len(latin_words)}): {penalty:.1f}")
+        
+        # 2. QUOTES PENALTY
+        if (msg.strip().startswith('"') and msg.strip().endswith('"')) or \
+           (msg.strip().startswith('«') and msg.strip().endswith('»')) or \
+           (msg.strip().startswith("'") and msg.strip().endswith("'")):
+            penalty = -20
+            score += penalty
+            details["penalties"].append(f"quotes: {penalty:.1f}")
+        
+        # 3. ELLIPSIS PENALTY
+        if msg.rstrip().endswith("...") or msg.rstrip().endswith("…"):
+            penalty = -15
+            score += penalty
+            details["penalties"].append(f"trailing_ellipsis: {penalty:.1f}")
+        
+        # 4. CLICHES PENALTY (heavy)
+        cliche_count = sum(1 for cliche in FORBIDDEN_CLICHES if re.search(cliche, msg, re.IGNORECASE))
+        if cliche_count > 0:
+            penalty = cliche_count * -30
+            score += penalty
+            details["penalties"].append(f"cliches({cliche_count}): {penalty:.1f}")
+        
+        # 5. Length penalty (exponential for severe violations)
         length_ratio = len(msg) / max_length if max_length > 0 else 1.0
         if length_ratio > 1.0:
             penalty = (length_ratio - 1.0) ** 2 * 50  # Quadratic penalty
@@ -96,28 +137,66 @@ def rank_messages(
             score -= penalty
             details["penalties"].append(f"too_short: -{penalty:.1f}")
         
-        # 2. Generic phrases penalty
-        generic_count = sum(1 for phrase in GENERIC_PHRASES if re.search(phrase, msg, re.IGNORECASE))
-        if generic_count > 0:
-            penalty = generic_count * 5
-            score -= penalty
-            details["penalties"].append(f"generic_phrases({generic_count}): -{penalty:.1f}")
+        # 6. GENERIC TEXT PENALTY (no category, no CTA)
+        has_category = user_category and user_category.lower() in msg.lower()
+        has_cta = any(re.search(verb, msg, re.IGNORECASE) for verb in CTA_VERBS)
         
-        # 3. Specific details bonus
+        if not has_category and not has_cta:
+            penalty = -20
+            score += penalty
+            details["penalties"].append(f"too_generic: {penalty:.1f}")
+        elif not has_category:
+            penalty = -10
+            score += penalty
+            details["penalties"].append(f"no_category_mention: {penalty:.1f}")
+        elif not has_cta:
+            penalty = -10
+            score += penalty
+            details["penalties"].append(f"no_cta: {penalty:.1f}")
+        
+        # 7. CTA BONUS
+        cta_count = sum(1 for verb in CTA_VERBS if re.search(verb, msg, re.IGNORECASE))
+        if cta_count > 0:
+            bonus = 10
+            score += bonus
+            details["bonuses"].append(f"cta_verbs({cta_count}): +{bonus:.1f}")
+        
+        # 8. CATEGORY MENTION BONUS
+        if user_category and user_category.lower() in msg.lower():
+            bonus = 10
+            score += bonus
+            details["bonuses"].append(f"category_mention: +{bonus:.1f}")
+        
+        # 9. SPECIFIC DETAILS BONUS
         specific_count = sum(1 for phrase in SPECIFIC_PHRASES if re.search(phrase, msg, re.IGNORECASE))
         if specific_count > 0:
             bonus = specific_count * 10
             score += bonus
             details["bonuses"].append(f"specific_details({specific_count}): +{bonus:.1f}")
         
-        # 4. CTA bonus
-        cta_count = sum(1 for phrase in CTA_PHRASES if re.search(phrase, msg, re.IGNORECASE))
-        if cta_count > 0:
-            bonus = cta_count * 8
+        # 10. LENGTH BONUS (fits channel)
+        if channel == "push" and len(msg) <= max_length:
+            bonus = 10
             score += bonus
-            details["bonuses"].append(f"cta_phrases({cta_count}): +{bonus:.1f}")
+            details["bonuses"].append(f"push_length_ok: +{bonus:.1f}")
+        elif channel in ["email", "inapp"] and 50 <= len(msg) <= max_length:
+            bonus = 10
+            score += bonus
+            details["bonuses"].append(f"channel_length_ok: +{bonus:.1f}")
         
-        # 5. Style compliance bonus
+        # 11. EMOJI BONUS (for friendly style, 0-1 emoji)
+        if style == "дружелюбный":
+            emoji_count = len(re.findall(r'[🎉🔥⚡🎁💎✨🌟💫]', msg))
+            if emoji_count == 0 or emoji_count == 1:
+                bonus = 5
+                score += bonus
+                details["bonuses"].append(f"emoji_count_ok({emoji_count}): +{bonus:.1f}")
+            elif emoji_count > 2:
+                penalty = -5
+                score += penalty
+                details["penalties"].append(f"too_many_emojis({emoji_count}): {penalty:.1f}")
+        
+        # 12. Style compliance bonus
         style_bonus = _check_style_compliance(msg, style, channel)
         if style_bonus > 0:
             score += style_bonus
@@ -131,11 +210,17 @@ def rank_messages(
     
     best_message, best_score, best_details = scored_messages[0]
     
+    # Log detailed breakdown
     logger.debug(
         "Selected message variant %d with score %.1f (from %d variants)",
         best_details["variant"],
         best_score,
         len(messages),
+    )
+    logger.debug(
+        "Score breakdown - Penalties: %s, Bonuses: %s",
+        best_details["penalties"],
+        best_details["bonuses"],
     )
     
     return best_message, best_score, best_details
@@ -171,8 +256,6 @@ def _check_style_compliance(message: str, style: str, channel: str) -> float:
         friendly_words = ["добро пожаловать", "спасибо", "рады"]
         if any(word in message_lower for word in friendly_words):
             bonus += 5
-        if "🎉" in message or "🎁" in message:
-            bonus += 2
     
     elif style == "информативный":
         # Check for informative content

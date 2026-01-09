@@ -1,26 +1,39 @@
 """Build prompts from segment profiles and campaign requests."""
 
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from src.core.types import SegmentProfile, CampaignRequest
 from src.prompting.templates import get_template
 
 logger = logging.getLogger(__name__)
 
+# Запрещенные клише
+FORBIDDEN_CLICHES = [
+    "у нас много новинок",
+    "заканчивай покупку",
+    "возвращайся к",
+    "мы заметили, что",
+    "у нас широкий ассортимент",
+    "большой выбор",
+    "много товаров",
+]
+
 
 def build_prompt(
     segment_profile: SegmentProfile,
     campaign_request: CampaignRequest,
     max_length: Optional[int] = None,
+    user_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Build complete prompt for LLM generation.
+    Build complete prompt for LLM generation with strict copy rules.
     
     Args:
         segment_profile: Segment profile with aggregated data
         campaign_request: Campaign configuration
         max_length: Maximum message length (overrides channel default)
+        user_context: Optional user-level context (without PII)
         
     Returns:
         Complete prompt string
@@ -54,6 +67,43 @@ def build_prompt(
     if segment_profile.avg_churn_risk > 0.7:
         segment_context += "- Высокий риск оттока\n"
     
+    # Add user-level context (without PII)
+    user_context_str = ""
+    if user_context:
+        user_parts = []
+        
+        # Category interest
+        category = (
+            user_context.get("last_view_category")
+            or user_context.get("category_affinity_top")
+            or user_context.get("last_category")
+        )
+        if category:
+            user_parts.append(f"- Интерес к категории: {category}")
+        
+        # Abandoned cart
+        if user_context.get("abandoned_cart_flag"):
+            user_parts.append("- Есть брошенная корзина")
+        
+        # Days since last activity
+        days_inactive = user_context.get("days_since_last_activity")
+        if days_inactive is not None:
+            user_parts.append(f"- Дней с последней активности: {int(days_inactive)}")
+        
+        # Price sensitivity
+        price_sens = user_context.get("price_sensitivity")
+        if price_sens is not None:
+            if price_sens > 0.6:
+                user_parts.append("- Высокая чувствительность к цене")
+            elif price_sens < 0.4:
+                user_parts.append("- Низкая чувствительность к цене")
+        
+        if user_parts:
+            user_context_str = f"""
+Контекст пользователя (без PII):
+{chr(10).join(user_parts)}
+"""
+    
     # Add length constraint
     length_limit = max_length or campaign_request.max_length
     if length_limit:
@@ -61,35 +111,62 @@ def build_prompt(
     else:
         length_instruction = ""
     
-    # Add quality instructions
-    quality_instructions = """
-Требования к качеству сообщения:
-- Сообщение должно быть персонализированным и релевантным для данного сегмента
-- Используй конкретные детали из описания сегмента для повышения релевантности
-- Сообщение должно быть убедительным и мотивирующим
-- Избегай общих фраз, используй специфичные для сегмента аргументы
-- Учитывай психологию сегмента (активность, покупки, риски)
-- Сообщение должно звучать естественно и человечно
+    # Channel-specific rules
+    channel = campaign_request.channel
+    if channel == "push":
+        channel_rules = """
+Правила для Push-уведомлений:
+- Одна главная мысль
+- Один четкий CTA (призыв к действию)
+- Максимум 1 эмодзи
+- Не более 1 восклицательного знака
+- Структура: Хук → Выгода/Причина → CTA
+"""
+    else:
+        channel_rules = ""
+    
+    # Strict copy rules
+    copy_rules = f"""
+СТРОГИЕ ПРАВИЛА КОПИРАЙТИНГА (ОБЯЗАТЕЛЬНО):
+
+1. ЯЗЫК:
+   - ТОЛЬКО русский язык
+   - ЗАПРЕЩЕНА латиница (A-Z, a-z) в тексте сообщения
+   - Используй только кириллицу
+
+2. ФОРМАТ:
+   - ЗАПРЕЩЕНЫ кавычки вокруг сообщения (", «», "")
+   - ЗАПРЕЩЕНО окончание на "..." или "..."
+   - Сообщение должно заканчиваться точкой, восклицательным знаком или без знака препинания
+
+3. ЗАПРЕЩЕННЫЕ КЛИШЕ (НЕ ИСПОЛЬЗУЙ):
+{chr(10).join(f"   - {cliche}" for cliche in FORBIDDEN_CLICHES)}
+
+4. СТРУКТУРА:
+   - Начни с хука (привлечение внимания)
+   - Добавь выгоду или причину
+   - Заверши четким CTA (призыв к действию)
+   - Если известна категория интереса - упомяни её естественно 1 раз
+
+5. КОНКРЕТИКА:
+   - Используй конкретные детали из контекста сегмента
+   - Избегай общих фраз
+   - Будь специфичным и релевантным
+{channel_rules}
 """
     
     # Combine
     full_prompt = f"""{template}
 
 {segment_context}
+{user_context_str}
 
-{quality_instructions}
+{copy_rules}
 
 Задача: Создай ОДНО высококачественное персонализированное маркетинговое сообщение для этого сегмента пользователей.{length_instruction}
 
-Сообщение должно быть:
-- Максимально релевантным для характеристик сегмента
-- Убедительным и мотивирующим
-- Естественным и человечным
-- Соответствующим цели кампании и каналу коммуникации
-
-Формат ответа: просто напиши текст сообщения без дополнительных пояснений, меток или нумерации."""
+ВАЖНО: Верни ТОЛЬКО текст сообщения, без пояснений, без кавычек, без меток, без нумерации. Просто чистый текст сообщения на русском языке."""
     
     logger.debug(f"Built prompt for segment {segment_profile.segment_label}, goal {campaign_request.goal}")
     
     return full_prompt
-
