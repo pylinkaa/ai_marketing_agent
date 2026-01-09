@@ -41,19 +41,37 @@ def train_segmentation_model(
     
     # Train/test split
     if test_size > 0.0:
-        # Check if we can use stratify (need at least 2 samples per class)
+        # Check if we can use stratify
         unique_classes, class_counts = np.unique(y_encoded, return_counts=True)
+        n_classes = len(unique_classes)
         min_class_count = class_counts.min() if len(class_counts) > 0 else 0
-        can_stratify = len(unique_classes) > 1 and min_class_count >= 2
+        total_samples = len(y_encoded)
+        test_samples = int(total_samples * test_size)
+        
+        # Conditions for stratified split:
+        # 1. More than 1 class
+        # 2. At least 2 samples per class
+        # 3. Test set size >= number of classes (to fit at least 1 sample per class)
+        can_stratify = (
+            n_classes > 1
+            and min_class_count >= 2
+            and test_samples >= n_classes
+        )
         
         if can_stratify:
-            logger.debug("Using stratified train/test split (min class size: %d)", min_class_count)
+            logger.debug(
+                "Using stratified train/test split (classes: %d, min class size: %d, test size: %d)",
+                n_classes,
+                min_class_count,
+                test_samples,
+            )
             stratify_param = y_encoded
         else:
             logger.debug(
-                "Cannot use stratified split (classes: %d, min class size: %d), using random split",
-                len(unique_classes),
+                "Cannot use stratified split (classes: %d, min class size: %d, test size: %d), using random split",
+                n_classes,
                 min_class_count,
+                test_samples,
             )
             stratify_param = None
         
